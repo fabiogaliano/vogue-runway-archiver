@@ -1,42 +1,114 @@
 # Vogue Runway Scraper
-Scrapes high resolution images from [Vogue Runway](https://www.vogue.com/fashion-shows).
 
-![gucci-spring-2018-ready-to-wear-1](https://github.com/TonyAssi/Vogue-Runway-Scraper/assets/42156881/081f2c82-fbc5-419f-a0e8-52f8f1a8cdcd)
+Scrapes Vogue Runway show data and downloads images slowly enough to be resumable and safer for long runs.
 
-Try out the Web Demo: [![🤗 Hugging Face Spaces](https://img.shields.io/badge/Hugging%20Face-Spaces-blue?logo=huggingface&logoColor=white)](https://huggingface.co/spaces/tonyassi/vogue-runway)
+## Install
 
-
-## Installation
 ```bash
 pip install -r requirements.txt
 ```
 
-## Usage
-Import the scraper module
+## Quick Start
+
 ```python
 import vogue
 ```
-Get a list of all the runway shows from a particular designer
+
+Get all shows for a designer:
+
 ```python
-vogue.designer_to_shows('gucci')
+vogue.designer_to_shows("gucci")
 ```
-Download images from a designer and specific runway show
+
+Download one show:
+
 ```python
-vogue.designer_show_to_download_images('gucci', 'Spring 2018 Ready-to-Wear', './images')
+vogue.designer_show_to_download_images("gucci", "Spring 2018 Ready-to-Wear")
 ```
-Download all images from all shows of a designer
+
+Download all shows for one designer:
+
 ```python
-vogue.designer_to_download_images('gucci', './images')
+vogue.designer_to_download_images("gucci")
 ```
-Save image urls to csv from a designer and specific runway show
+
+Download all designers from a text file with resume support:
+
 ```python
-vogue.designer_show_to_csv('gucci', 'Spring 2018 Ready-to-Wear', '.')
+vogue.all_designers_to_download_images("designers.txt")
 ```
-Save image urls to csv from a designer for all shows
+
+By default, downloads are saved to:
+
+```text
+vogue_downloads
+```
+
+You can still override it by passing a custom path as the last argument.
+
+Run the full download from the terminal:
+
+```bash
+python3 vogue.py download-all
+```
+
+That uses `designers.txt` and the default output folder above.
+
+Export one show to CSV:
+
 ```python
-vogue.designer_to_csv('gucci', '.')
+vogue.designer_show_to_csv("gucci", "Spring 2018 Ready-to-Wear", ".")
 ```
-Save image urls to csv from all designers in a .txt file
+
+Export all shows for one designer to CSV:
+
 ```python
-vogue.all_designers_to_csv('designers.txt', '.')
+vogue.designer_to_csv("gucci", ".")
 ```
+
+Export all designers from a text file to CSV:
+
+```python
+vogue.all_designers_to_csv("designers.txt", ".")
+```
+
+## What Gets Saved
+
+For downloads, each show is stored like this:
+
+```text
+images/
+  miu-miu/
+    2026-fall-ready-to-wear/
+      description.md
+      show_metadata.json
+      collection/
+        look_0001.jpg
+      details/
+        detail_0001.jpg
+```
+
+- `collection/` and `details/` are downloaded when available
+- `beauty/` is skipped
+- `description.md` stores the full show review text
+- `show_metadata.json` stores structured metadata for resume logic and later ML/data work
+
+## Resume Behavior
+
+Long runs keep a central state file at:
+
+```text
+vogue_downloads/_scrape_state.json
+```
+
+You can stop the terminal and run the same command again later. The scraper will:
+
+- reload the saved state
+- check files already on disk
+- continue from the remaining designers, shows, and images
+
+## Notes
+
+- Requests are intentionally slowed with randomized delays, rotating user agents, and retries
+- show folders use designer-first, year-first naming like `miu-miu/2026-fall-ready-to-wear/`
+- CSV rows include `designer`, `show`, `gallery`, `show_description`, `image_index`, `image_name`, and `image_url`
