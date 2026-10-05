@@ -1,4 +1,6 @@
-# Vogue Runway Scraper
+# Vogue Runway Archiver
+
+Based on [TonyAssi/Vogue-Runway-Scraper](https://github.com/TonyAssi/Vogue-Runway-Scraper).
 
 Scrapes Vogue Runway show data and downloads images slowly enough to be resumable and safer for long runs.
 
