@@ -80,7 +80,7 @@ REQUEST_PROFILES = {
 }
 # Image concurrency adapts: it grows slowly while downloads are clean and halves at the
 # first throttling signal, so the rate settles just below what the CDN tolerates.
-IMAGE_WORKERS_START = 3
+IMAGE_WORKERS_START = 5
 IMAGE_WORKERS_MAX = 12
 IMAGE_GROW_AFTER = 60
 # A worker that adds less than this much throughput only adds load on Vogue.
