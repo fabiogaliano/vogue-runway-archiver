@@ -125,6 +125,10 @@ python3 vogue.py report                   # what failed, grouped by cause
 - `report` groups everything still incomplete by kind: `designer_not_found`, `show_not_found`, `show_unparseable`, `images_failed`, `request_failed`, `ssl_error`, ...
 - When Vogue throttles (it answers 404/429), the scraper checks a known page, pauses 15 minutes, and stops after repeated blocks instead of marking everything as failed
 
+## Pacing
+
+Image downloads pace themselves from Vogue's own responses, with no extra probing. They start at 3 parallel downloads and add one after every 40 clean downloads, up to 8. A 429/403/503 or a dropped connection halves the count and pauses 60s (or longer if Vogue sends `Retry-After`). The progress line shows the current pace (`×5`, or `paused`), and each throttle is logged as `throttled` in `_failures.jsonl`. Page requests stay on slow fixed delays.
+
 ## Designer URLs
 
 Vogue's URL names don't always follow the names in `designers.txt` (`Agnès B.` → `agnes-b-`, `Burberry` → `burberry-prorsum`). The scraper looks names up in Vogue's designer directory (cached for a week in `_designer_directory.json`) and falls back to guessed slugs. The slug that worked is stored in the state file. Show URLs are taken from the designer page instead of being guessed.

@@ -142,3 +142,62 @@ def test_report_groups_failures(state):
     report = vogue.build_report(state.data)
     assert "designer_not_found (1)" in report
     assert "show_not_found (1)" in report
+
+
+def test_limiter_grows_on_success_and_halves_on_throttle(monkeypatch):
+    monkeypatch.setattr(vogue, "THROTTLE_PAUSE", 0)
+    limiter = vogue.AdaptiveLimiter(start=3, minimum=1, maximum=8, grow_after=2)
+    for _ in range(4):
+        limiter.on_success()
+    assert limiter.limit == 5
+
+    limiter.on_throttle()
+    assert (limiter.limit, limiter.throttle_events) == (2, 1)
+
+
+def test_limiter_counts_a_burst_of_throttles_once():
+    limiter = vogue.AdaptiveLimiter(start=8, minimum=1, maximum=8, grow_after=40)
+    for _ in range(5):
+        limiter.on_throttle()
+    assert (limiter.limit, limiter.throttle_events) == (4, 1)
+
+
+class FakeResponse:
+    def __init__(self, status_code, headers=None, content=b"img"):
+        self.status_code = status_code
+        self.ok = status_code < 400
+        self.headers = headers or {"Content-Type": "image/webp"}
+        self.content = content
+
+
+class FakeSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+
+    def get(self, url, headers, timeout):
+        return self.responses.pop(0)
+
+
+def test_image_download_backs_off_on_429_then_succeeds(tmp_path, monkeypatch):
+    monkeypatch.setattr(vogue, "IMAGE_DELAY", (0, 0))
+    monkeypatch.setattr(vogue, "THROTTLE_PAUSE", 0)
+    limiter = vogue.AdaptiveLimiter(start=4, minimum=1, maximum=8, grow_after=40)
+    session = FakeSession([FakeResponse(429, {"Retry-After": "0"}), FakeResponse(200)])
+    record = {"image_name": "look_0001.jpg", "image_url": "https://assets.vogue.com/x.jpg"}
+
+    _, status = vogue._download_single_image(session, record, str(tmp_path), "ref", limiter)
+
+    assert status == "downloaded"
+    assert (limiter.limit, limiter.throttle_events) == (2, 1)
+    assert (tmp_path / "look_0001.jpg").read_bytes() == b"img"
+
+
+def test_image_download_rejects_html_served_as_200(tmp_path, monkeypatch):
+    monkeypatch.setattr(vogue, "IMAGE_DELAY", (0, 0))
+    session = FakeSession([FakeResponse(200, {"Content-Type": "text/html"})])
+    record = {"image_name": "look_0001.jpg", "image_url": "https://assets.vogue.com/x.jpg"}
+
+    _, status = vogue._download_single_image(session, record, str(tmp_path), "ref")
+
+    assert status.startswith("error: not an image")
+    assert not (tmp_path / "look_0001.jpg").exists()

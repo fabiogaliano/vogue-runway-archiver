@@ -8,6 +8,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -77,9 +78,15 @@ REQUEST_PROFILES = {
     "show": (7.0, 16.0),
     "designer": (12.0, 24.0),
 }
-# The last full run exhausted retries on assets.vogue.com at 4 workers / 0.3-1.0s.
-IMAGE_WORKERS = 3
-IMAGE_DELAY = (0.5, 1.5)
+# Image concurrency adapts: it grows slowly while downloads are clean and halves at the
+# first throttling signal, so the rate settles just below what the CDN tolerates.
+IMAGE_WORKERS_START = 3
+IMAGE_WORKERS_MAX = 8
+IMAGE_GROW_AFTER = 40
+IMAGE_DELAY = (0.2, 0.6)
+IMAGE_ATTEMPTS = 4
+THROTTLE_PAUSE = 60
+THROTTLE_STATUSES = {403, 429, 503}
 
 
 class NotFound(Exception):
@@ -488,6 +495,86 @@ def _progress_bar(current, total, width=20):
     return "█" * filled + "░" * (width - filled)
 
 
+class AdaptiveLimiter:
+    def __init__(self, start, minimum, maximum, grow_after):
+        self.limit = start
+        self.minimum = minimum
+        self.maximum = maximum
+        self.grow_after = grow_after
+        self.active = 0
+        self.successes = 0
+        self.cooldown_until = 0.0
+        self.throttle_events = 0
+        self.closed = False
+        self._condition = threading.Condition()
+
+    def __enter__(self):
+        with self._condition:
+            while True:
+                if self.closed:
+                    raise RuntimeError("limiter closed")
+                wait = self.cooldown_until - time.monotonic()
+                if wait > 0:
+                    self._condition.wait(min(wait, 1.0))
+                elif self.active < self.limit:
+                    break
+                else:
+                    self._condition.wait(1.0)
+            self.active += 1
+        return self
+
+    def __exit__(self, *exc_info):
+        with self._condition:
+            self.active -= 1
+            self._condition.notify_all()
+
+    def on_success(self):
+        with self._condition:
+            self.successes += 1
+            if self.successes >= self.grow_after and self.limit < self.maximum:
+                self.limit += 1
+                self.successes = 0
+                self._condition.notify_all()
+
+    def on_throttle(self, retry_after=None):
+        with self._condition:
+            now = time.monotonic()
+            # In-flight requests fail together when throttled; one burst is one event.
+            if now < self.cooldown_until:
+                return
+            self.throttle_events += 1
+            self.limit = max(self.minimum, self.limit // 2)
+            self.successes = 0
+            self.cooldown_until = now + max(retry_after or 0, THROTTLE_PAUSE)
+            self._condition.notify_all()
+
+    def close(self):
+        with self._condition:
+            self.closed = True
+            self._condition.notify_all()
+
+
+IMAGE_LIMITER = AdaptiveLimiter(IMAGE_WORKERS_START, 1, IMAGE_WORKERS_MAX, IMAGE_GROW_AFTER)
+
+
+def parse_retry_after(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+class ReportingRetry(Retry):
+    # urllib3 retries 429/503 silently; surfacing them is the only way to know a page
+    # request was throttled, and images should slow down too when that happens.
+    def increment(self, method=None, url=None, response=None, error=None, *args, **kwargs):
+        if response is not None and response.status in THROTTLE_STATUSES:
+            retry_after = parse_retry_after(response.headers.get("Retry-After"))
+            print(f"\n    ⇣ Vogue returned {response.status} for a page; backing off")
+            IMAGE_LIMITER.on_throttle(retry_after)
+        return super().increment(method, url, response, error, *args, **kwargs)
+
+
 class VogueClient:
     def __init__(self):
         self.session = requests.Session()
@@ -502,7 +589,7 @@ class VogueClient:
         )
         self.last_request_at = 0.0
 
-        retry = Retry(
+        retry = ReportingRetry(
             total=5,
             backoff_factor=2,
             status_forcelist=(429, 500, 502, 503, 504),
@@ -512,6 +599,15 @@ class VogueClient:
         adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
+
+        # Images handle throttling themselves (see _download_single_image), so this
+        # session only retries plain server errors.
+        self.image_session = requests.Session()
+        image_retry = Retry(total=2, backoff_factor=1, status_forcelist=(500, 502, 504), allowed_methods=("GET",))
+        image_adapter = HTTPAdapter(
+            max_retries=image_retry, pool_connections=IMAGE_WORKERS_MAX, pool_maxsize=IMAGE_WORKERS_MAX,
+        )
+        self.image_session.mount("https://", image_adapter)
 
     def _sleep(self, profile):
         minimum, maximum = REQUEST_PROFILES[profile]
@@ -711,19 +807,32 @@ def write_show_metadata(show_path, show_data):
         file.write("\n")
 
 
-def _download_single_image(session, record, gallery_path, referer):
+def _download_single_image(session, record, gallery_path, referer, limiter=IMAGE_LIMITER):
     export_path = os.path.join(gallery_path, record["image_name"])
     if is_downloaded(export_path):
         return record, "skipped"
 
-    time.sleep(random.uniform(*IMAGE_DELAY))
-    try:
-        headers = {
-            "User-Agent": random.choice(USER_AGENTS),
-            "Referer": referer,
-        }
-        response = session.get(record["image_url"], headers=headers, timeout=120)
-        response.raise_for_status()
+    headers = {"Referer": referer}
+    status = "error: not attempted"
+    for _ in range(IMAGE_ATTEMPTS):
+        with limiter:
+            time.sleep(random.uniform(*IMAGE_DELAY))
+            headers["User-Agent"] = random.choice(USER_AGENTS)
+            try:
+                response = session.get(record["image_url"], headers=headers, timeout=120)
+            except (requests.ConnectionError, requests.Timeout) as e:
+                # Dropped connections were how the CDN pushed back in the last full run.
+                limiter.on_throttle()
+                status = f"error: {e}"
+                continue
+
+        if response.status_code in THROTTLE_STATUSES:
+            limiter.on_throttle(parse_retry_after(response.headers.get("Retry-After")))
+            status = f"error: HTTP {response.status_code} (throttled)"
+            continue
+        if not response.ok:
+            return record, f"error: HTTP {response.status_code} for {record['image_url']}"
+
         content_type = response.headers.get("Content-Type", "")
         # A throttling or error page served with 200 would otherwise be saved as a .jpg
         # and count as done forever.
@@ -733,9 +842,9 @@ def _download_single_image(session, record, gallery_path, referer):
         with open(temp_path, "wb") as file:
             file.write(response.content)
         os.replace(temp_path, export_path)
+        limiter.on_success()
         return record, "downloaded"
-    except Exception as e:
-        return record, f"error: {e}"
+    return record, status
 
 
 class Scraper:
@@ -900,6 +1009,7 @@ class Scraper:
 
         errors = []
         total_images = len(show_data["images"])
+        throttles_before = IMAGE_LIMITER.throttle_events
 
         for gallery_name, gallery_images in show_data["galleries"].items():
             gallery_path = os.path.join(show_path, gallery_name)
@@ -908,11 +1018,11 @@ class Scraper:
             gallery_done = 0
             gallery_errors = 0
 
-            executor = concurrent.futures.ThreadPoolExecutor(max_workers=IMAGE_WORKERS)
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=IMAGE_WORKERS_MAX)
             try:
                 futures = [
                     executor.submit(
-                        _download_single_image, CLIENT.session, record, gallery_path, show_data["show_url"],
+                        _download_single_image, CLIENT.image_session, record, gallery_path, show_data["show_url"],
                     )
                     for record in gallery_images
                 ]
@@ -923,18 +1033,28 @@ class Scraper:
                         gallery_errors += 1
                         errors.append((record, status))
                     bar = _progress_bar(gallery_done, gallery_total)
-                    line = f"\r    {gallery_name:<12} {bar}  {gallery_done}/{gallery_total}"
+                    pace = "paused" if IMAGE_LIMITER.cooldown_until > time.monotonic() else f"×{IMAGE_LIMITER.limit}"
+                    line = f"\r    {gallery_name:<12} {bar}  {gallery_done}/{gallery_total}  {pace}"
                     sys.stdout.write(f"{line:<60}")
                     sys.stdout.flush()
             except KeyboardInterrupt:
                 # Without cancelling, Ctrl-C waits for every queued image in the gallery.
                 executor.shutdown(wait=False, cancel_futures=True)
+                IMAGE_LIMITER.close()
                 raise
             executor.shutdown()
 
             bar = _progress_bar(gallery_done, gallery_total)
             suffix = f"⚠ {gallery_errors} failed" if gallery_errors else "✓"
             print(f"\r    {gallery_name:<12} {bar}  {gallery_done}/{gallery_total}  {suffix}")
+
+        throttles = IMAGE_LIMITER.throttle_events - throttles_before
+        if throttles:
+            print(f"    ⇣ throttled {throttles}× during this show; now ×{IMAGE_LIMITER.limit} workers")
+            self.failures.add(
+                "throttled", designer, f"{throttles} throttle event(s), workers now {IMAGE_LIMITER.limit}",
+                show=show, url=show_data["show_url"],
+            )
 
         self.state.sync_show(show_data, show_path)
         if errors:
