@@ -87,7 +87,8 @@ IMAGE_GROW_AFTER = 60
 PLATEAU_GAIN = 0.10
 # A learned ceiling is re-probed after this long, since throttling thresholds drift.
 CEILING_MAX_AGE = 24 * 3600
-IMAGE_DELAY = (0.2, 0.6)
+# Politeness comes from the adaptive limiter; a fixed per-image sleep only idles workers.
+IMAGE_DELAY = (0.05, 0.25)
 IMAGE_ATTEMPTS = 4
 THROTTLE_PAUSE = 60
 THROTTLE_STATUSES = {403, 429, 503}
@@ -677,8 +678,9 @@ class VogueClient:
         return response
 
     def rest(self, profile):
-        minimum, maximum = REQUEST_PROFILES[profile]
-        time.sleep(random.uniform(minimum, maximum))
+        # Measured from the last page request, so time spent downloading images counts
+        # toward the gap instead of being stacked on top of it.
+        self._sleep(profile)
 
 
 CLIENT = VogueClient()

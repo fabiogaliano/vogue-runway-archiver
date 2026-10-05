@@ -246,3 +246,18 @@ def test_image_download_rejects_html_served_as_200(tmp_path, monkeypatch):
 
     assert status.startswith("error: not an image")
     assert not (tmp_path / "look_0001.jpg").exists()
+
+
+def test_rest_counts_time_since_last_page_request(monkeypatch):
+    client = vogue.VogueClient()
+    clock = [1000.0]
+    slept = []
+    monkeypatch.setattr(vogue.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(vogue.time, "sleep", slept.append)
+    monkeypatch.setattr(vogue.random, "uniform", lambda low, high: 10.0)
+
+    client.last_request_at = 1000.0
+    clock[0] = 1007.0  # 7s of image downloads since the page was fetched
+    client.rest("show")
+
+    assert slept == [3.0]
