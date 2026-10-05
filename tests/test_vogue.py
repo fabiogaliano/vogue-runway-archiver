@@ -152,7 +152,52 @@ def test_limiter_grows_on_success_and_halves_on_throttle(monkeypatch):
     assert limiter.limit == 5
 
     limiter.on_throttle()
-    assert (limiter.limit, limiter.throttle_events) == (2, 1)
+    assert (limiter.limit, limiter.ceiling, limiter.throttle_events) == (2, 4, 1)
+
+
+def drive(limiter, monkeypatch, seconds_per_success):
+    clock = [1000.0]
+    monkeypatch.setattr(vogue.time, "monotonic", lambda: clock[0])
+    limiter._reset_window()
+
+    def succeed():
+        clock[0] += seconds_per_success(limiter.limit)
+        limiter.on_success()
+
+    return succeed
+
+
+def test_limiter_stops_growing_when_throughput_plateaus(monkeypatch):
+    limiter = vogue.AdaptiveLimiter(start=3, minimum=1, maximum=12, grow_after=10)
+    # Throughput scales with workers up to 5, then is capped (e.g. by bandwidth).
+    succeed = drive(limiter, monkeypatch, lambda level: 1 / min(level, 5))
+    for _ in range(200):
+        succeed()
+    assert limiter.limit == limiter.ceiling == 5
+
+
+def test_limiter_idle_gaps_do_not_count_as_slow_downloads(monkeypatch):
+    limiter = vogue.AdaptiveLimiter(start=3, minimum=1, maximum=12, grow_after=10)
+    clock = [1000.0]
+    monkeypatch.setattr(vogue.time, "monotonic", lambda: clock[0])
+    limiter._reset_window()
+    for level_round in range(2):
+        for _ in range(10):
+            with limiter:
+                clock[0] += 1 / limiter.limit
+            limiter.on_success()
+        clock[0] += 30  # page fetch between shows
+    assert limiter.limit == 5
+
+
+def test_limiter_restores_learned_pace(monkeypatch):
+    limiter = vogue.AdaptiveLimiter(start=3, minimum=1, maximum=12, grow_after=10)
+    limiter.restore({"limit": 6, "ceiling": 7, "saved_at": vogue.time.time()})
+    assert (limiter.limit, limiter.ceiling) == (6, 7)
+
+    stale = vogue.AdaptiveLimiter(start=3, minimum=1, maximum=12, grow_after=10)
+    stale.restore({"limit": 6, "ceiling": 7, "saved_at": 0})
+    assert (stale.limit, stale.ceiling) == (6, 12)
 
 
 def test_limiter_counts_a_burst_of_throttles_once():

@@ -127,7 +127,14 @@ python3 vogue.py report                   # what failed, grouped by cause
 
 ## Pacing
 
-Image downloads pace themselves from Vogue's own responses, with no extra probing. They start at 3 parallel downloads and add one after every 40 clean downloads, up to 8. A 429/403/503 or a dropped connection halves the count and pauses 60s (or longer if Vogue sends `Retry-After`). The progress line shows the current pace (`×5`, or `paused`), and each throttle is logged as `throttled` in `_failures.jsonl`. Page requests stay on slow fixed delays.
+Image downloads find their own best pace from Vogue's responses, with no extra probing:
+
+- After every 60 clean downloads they try one more parallel download, up to 12. Time spent between galleries (page fetches, rests) isn't counted.
+- If the extra worker raises throughput by less than 10%, they drop back one and stop there, since more concurrency would only add load.
+- A 429/403/503 or a dropped connection halves the count, pauses 60s (or longer if Vogue sends `Retry-After`), and caps future growth one below the level that got throttled.
+- The learned pace, cap and measured images/second per level are saved to `_pacing.json`, and the next run starts from them. The cap is re-tested after 24h.
+
+The progress line shows the current pace (`×5`, or `paused`), and each throttle is logged as `throttled` in `_failures.jsonl`. Page requests stay on slow fixed delays.
 
 ## Designer URLs
 

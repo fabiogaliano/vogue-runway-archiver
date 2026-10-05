@@ -81,8 +81,12 @@ REQUEST_PROFILES = {
 # Image concurrency adapts: it grows slowly while downloads are clean and halves at the
 # first throttling signal, so the rate settles just below what the CDN tolerates.
 IMAGE_WORKERS_START = 3
-IMAGE_WORKERS_MAX = 8
-IMAGE_GROW_AFTER = 40
+IMAGE_WORKERS_MAX = 12
+IMAGE_GROW_AFTER = 60
+# A worker that adds less than this much throughput only adds load on Vogue.
+PLATEAU_GAIN = 0.10
+# A learned ceiling is re-probed after this long, since throttling thresholds drift.
+CEILING_MAX_AGE = 24 * 3600
 IMAGE_DELAY = (0.2, 0.6)
 IMAGE_ATTEMPTS = 4
 THROTTLE_PAUSE = 60
@@ -501,12 +505,20 @@ class AdaptiveLimiter:
         self.minimum = minimum
         self.maximum = maximum
         self.grow_after = grow_after
+        self.ceiling = maximum
         self.active = 0
         self.successes = 0
         self.cooldown_until = 0.0
         self.throttle_events = 0
         self.closed = False
+        self.level_rates = {}
         self._condition = threading.Condition()
+        self._reset_window()
+
+    def _reset_window(self):
+        self.successes = 0
+        self._window_started = time.monotonic()
+        self._idle_since = self._window_started if self.active == 0 else None
 
     def __enter__(self):
         with self._condition:
@@ -520,21 +532,36 @@ class AdaptiveLimiter:
                     break
                 else:
                     self._condition.wait(1.0)
+            # Gaps between galleries (page fetches, rests) aren't download time; leaving
+            # them in would make every level look slower than it is.
+            if self.active == 0 and self._idle_since is not None:
+                self._window_started += time.monotonic() - self._idle_since
+                self._idle_since = None
             self.active += 1
         return self
 
     def __exit__(self, *exc_info):
         with self._condition:
             self.active -= 1
+            if self.active == 0:
+                self._idle_since = time.monotonic()
             self._condition.notify_all()
 
     def on_success(self):
         with self._condition:
             self.successes += 1
-            if self.successes >= self.grow_after and self.limit < self.maximum:
+            if self.successes < self.grow_after:
+                return
+            elapsed = max(time.monotonic() - self._window_started, 1e-6)
+            self.level_rates[self.limit] = self.successes / elapsed
+            previous = self.level_rates.get(self.limit - 1)
+            if previous and self.level_rates[self.limit] < previous * (1 + PLATEAU_GAIN):
+                self.ceiling = self.limit - 1
+                self.limit = self.ceiling
+            elif self.limit < self.ceiling:
                 self.limit += 1
-                self.successes = 0
-                self._condition.notify_all()
+            self._reset_window()
+            self._condition.notify_all()
 
     def on_throttle(self, retry_after=None):
         with self._condition:
@@ -543,10 +570,27 @@ class AdaptiveLimiter:
             if now < self.cooldown_until:
                 return
             self.throttle_events += 1
+            self.ceiling = max(self.minimum, self.limit - 1)
             self.limit = max(self.minimum, self.limit // 2)
-            self.successes = 0
             self.cooldown_until = now + max(retry_after or 0, THROTTLE_PAUSE)
+            self._reset_window()
             self._condition.notify_all()
+
+    def snapshot(self):
+        with self._condition:
+            return {
+                "limit": self.limit,
+                "ceiling": self.ceiling,
+                "images_per_second": {str(level): round(rate, 2) for level, rate in sorted(self.level_rates.items())},
+                "saved_at": time.time(),
+            }
+
+    def restore(self, snapshot):
+        with self._condition:
+            if time.time() - snapshot.get("saved_at", 0) < CEILING_MAX_AGE:
+                self.ceiling = min(self.maximum, max(self.minimum, snapshot.get("ceiling", self.maximum)))
+            self.limit = min(self.ceiling, max(self.minimum, snapshot.get("limit", self.limit)))
+            self._reset_window()
 
     def close(self):
         with self._condition:
@@ -853,6 +897,10 @@ class Scraper:
         os.makedirs(self.save_path, exist_ok=True)
         self.state = ScrapeState(get_state_path(self.save_path, state_path))
         self.failures = FailureLog(os.path.join(self.save_path, "_failures.jsonl"))
+        self.pacing_path = os.path.join(self.save_path, "_pacing.json")
+        if os.path.exists(self.pacing_path):
+            with open(self.pacing_path, "r", encoding="utf-8") as file:
+                IMAGE_LIMITER.restore(json.load(file))
         self._directory = None
         self._canary_ok_at = 0.0
 
@@ -1056,6 +1104,9 @@ class Scraper:
                 show=show, url=show_data["show_url"],
             )
 
+        with open(self.pacing_path, "w", encoding="utf-8") as file:
+            json.dump(IMAGE_LIMITER.snapshot(), file, indent=2)
+
         self.state.sync_show(show_data, show_path)
         if errors:
             first_error = errors[0][1][len("error: "):]
@@ -1094,6 +1145,7 @@ class Scraper:
         skipped = len(designers) - len(todo)
         print(f"State file: {self.state.path}")
         print(f"Failure log: {self.failures.path}")
+        print(f"Image pace: ×{IMAGE_LIMITER.limit} (ceiling ×{IMAGE_LIMITER.ceiling})")
         if skipped:
             print(f"Skipping {skipped} designers (completed or not found). {len(todo)} to go.")
 
