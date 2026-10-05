@@ -1,15 +1,17 @@
+import argparse
+import collections
 import concurrent.futures
-import csv
 import copy
+import csv
 import json
 import os
 import random
+import re
 import sys
 import time
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -20,6 +22,13 @@ from unidecode import unidecode
 
 BASE_URL = "https://www.vogue.com"
 DEFAULT_SAVE_PATH = "vogue_downloads"
+DIRECTORY_URL = f"{BASE_URL}/fashion-shows/designers"
+DIRECTORY_MAX_AGE = 7 * 24 * 3600
+# Vogue answers with 404/429 when it throttles us, which looks identical to a wrong
+# slug. A page that has always existed tells the two apart.
+CANARY_URL = f"{BASE_URL}/fashion-shows/designer/chanel"
+BLOCK_COOLDOWN = 15 * 60
+MAX_BLOCK_RETRIES = 4
 CSV_COLUMNS = [
     "designer",
     "show",
@@ -65,16 +74,28 @@ USER_AGENTS = [
 ]
 REQUEST_PROFILES = {
     "page": (4.5, 11.0),
-    "asset": (1.2, 4.0),
     "show": (7.0, 16.0),
     "designer": (12.0, 24.0),
 }
-IMAGE_WORKERS = 4
-IMAGE_DELAY = (0.3, 1.0)
+# The last full run exhausted retries on assets.vogue.com at 4 workers / 0.3-1.0s.
+IMAGE_WORKERS = 3
+IMAGE_DELAY = (0.5, 1.5)
+
+
+class NotFound(Exception):
+    pass
+
+
+class Blocked(Exception):
+    pass
 
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def is_downloaded(path):
+    return os.path.isfile(path) and os.path.getsize(path) > 0
 
 
 class ScrapeState:
@@ -106,12 +127,16 @@ class ScrapeState:
             json.dump(self.data, file, indent=2, ensure_ascii=True)
         os.replace(temp_path, self.path)
 
+    def get_designer(self, designer_slug):
+        return self.data["designers"].get(designer_slug)
+
     def ensure_designer(self, designer, designer_slug):
         designer_state = self.data["designers"].setdefault(
             designer_slug,
             {
                 "designer": designer,
                 "designer_slug": designer_slug,
+                "url_slug": None,
                 "status": "pending",
                 "started_at": None,
                 "completed_at": None,
@@ -124,18 +149,14 @@ class ScrapeState:
         designer_state["designer_slug"] = designer_slug
         return designer_state
 
-    def ensure_show(self, show_data):
-        designer_state = self.ensure_designer(
-            show_data["designer"],
-            show_data["designer_slug"],
-        )
+    def ensure_show(self, designer, designer_slug, show, show_folder, show_url):
+        designer_state = self.ensure_designer(designer, designer_slug)
         show_state = designer_state["shows"].setdefault(
-            show_data["show_folder"],
+            show_folder,
             {
-                "show": show_data["show"],
-                "show_slug": show_data["show_slug"],
-                "show_folder": show_data["show_folder"],
-                "show_url": show_data["show_url"],
+                "show": show,
+                "show_folder": show_folder,
+                "show_url": show_url,
                 "status": "pending",
                 "started_at": None,
                 "completed_at": None,
@@ -146,11 +167,31 @@ class ScrapeState:
                 "galleries": {},
             },
         )
+        show_state["show"] = show
+        show_state["show_folder"] = show_folder
+        show_state["show_url"] = show_url
+        return designer_state, show_state
 
-        show_state["show"] = show_data["show"]
-        show_state["show_slug"] = show_data["show_slug"]
-        show_state["show_folder"] = show_data["show_folder"]
-        show_state["show_url"] = show_data["show_url"]
+    def mark_show_started(self, show_data):
+        designer_state, show_state = self._ensure_show_data(show_data)
+        timestamp = utc_now()
+        designer_state["started_at"] = designer_state["started_at"] or timestamp
+        designer_state["last_attempted_at"] = timestamp
+        if designer_state["status"] != "completed":
+            designer_state["status"] = "in_progress"
+        show_state["started_at"] = show_state["started_at"] or timestamp
+        show_state["last_attempted_at"] = timestamp
+
+    def sync_show(self, show_data, show_path):
+        _, show_state = self._ensure_show_data(show_data)
+        show_state["metadata_saved"] = os.path.exists(os.path.join(show_path, "show_metadata.json"))
+        show_state["description_saved"] = os.path.exists(os.path.join(show_path, "description.md"))
+        # Some seasons (e.g. Celine 2020-2022) were video-only: nothing to download,
+        # and leaving them pending made the designer re-scrape on every run.
+        show_state["empty"] = not show_data["galleries"]
+
+        any_downloaded = False
+        all_complete = True
 
         for gallery_name, images in show_data["galleries"].items():
             gallery_state = show_state["galleries"].setdefault(
@@ -165,28 +206,11 @@ class ScrapeState:
                     "last_error": None,
                 },
             )
-            gallery_state["total_images"] = len(images)
-
-        return designer_state, show_state
-
-    def sync_show(self, show_data, show_path):
-        designer_state, show_state = self.ensure_show(show_data)
-        metadata_path = os.path.join(show_path, "show_metadata.json")
-        description_path = os.path.join(show_path, "description.md")
-        show_state["metadata_saved"] = os.path.exists(metadata_path)
-        show_state["description_saved"] = os.path.exists(description_path)
-
-        any_downloaded = False
-        all_complete = True
-
-        for gallery_name, images in show_data["galleries"].items():
-            gallery_state = show_state["galleries"][gallery_name]
             downloaded_images = 0
             last_completed_image = 0
 
             for record in images:
-                export_path = os.path.join(show_path, gallery_name, record["image_name"])
-                if os.path.exists(export_path):
+                if is_downloaded(os.path.join(show_path, gallery_name, record["image_name"])):
                     downloaded_images += 1
                     last_completed_image = record["image_index"]
 
@@ -197,6 +221,7 @@ class ScrapeState:
             if downloaded_images == 0:
                 gallery_state["status"] = "pending"
                 gallery_state["completed_at"] = None
+                all_complete = False
             elif downloaded_images < len(images):
                 gallery_state["status"] = "in_progress"
                 gallery_state["completed_at"] = None
@@ -207,126 +232,91 @@ class ScrapeState:
                 gallery_state["completed_at"] = gallery_state["completed_at"] or utc_now()
                 any_downloaded = True
 
-            if downloaded_images != len(images):
-                all_complete = False
-
-        if show_data["galleries"] and all_complete:
+        if all_complete:
             show_state["status"] = "completed"
             show_state["completed_at"] = show_state["completed_at"] or utc_now()
-        elif any_downloaded or show_state["metadata_saved"] or show_state["description_saved"]:
+            show_state["last_error"] = None
+            show_state.pop("failure_kind", None)
+        elif any_downloaded or show_state["metadata_saved"]:
             show_state["status"] = "in_progress"
             show_state["completed_at"] = None
         else:
             show_state["status"] = "pending"
             show_state["completed_at"] = None
 
-        self._refresh_designer_status(designer_state)
-        self.save()
         return copy.deepcopy(show_state)
 
-    def mark_designer_started(self, designer, designer_slug):
-        designer_state = self.ensure_designer(designer, designer_slug)
-        designer_state["started_at"] = designer_state["started_at"] or utc_now()
-        designer_state["last_attempted_at"] = utc_now()
-        if designer_state["status"] != "completed":
-            designer_state["status"] = "in_progress"
-            designer_state["completed_at"] = None
-        self.save()
-
-    def mark_show_started(self, show_data):
-        designer_state, show_state = self.ensure_show(show_data)
-        timestamp = utc_now()
-        designer_state["started_at"] = designer_state["started_at"] or timestamp
-        designer_state["last_attempted_at"] = timestamp
-        designer_state["status"] = "in_progress"
-        designer_state["completed_at"] = None
-        show_state["started_at"] = show_state["started_at"] or timestamp
-        show_state["last_attempted_at"] = timestamp
-        show_state["status"] = "in_progress"
-        show_state["completed_at"] = None
-        self.save()
-
-    def mark_metadata_saved(self, show_data):
-        designer_state, show_state = self.ensure_show(show_data)
-        show_state["metadata_saved"] = True
-        show_state["description_saved"] = True
-        if show_state["status"] == "pending":
-            show_state["status"] = "in_progress"
-        self._refresh_designer_status(designer_state)
-        self.save()
-
-    def mark_image_downloaded(self, show_data, gallery_name, image_index):
-        designer_state, show_state = self.ensure_show(show_data)
-        gallery_state = show_state["galleries"][gallery_name]
-        gallery_state["started_at"] = gallery_state["started_at"] or utc_now()
-        gallery_state["downloaded_images"] = min(
-            gallery_state["total_images"],
-            gallery_state["downloaded_images"] + 1,
-        )
-        gallery_state["last_completed_image"] = max(
-            gallery_state["last_completed_image"],
-            image_index,
-        )
-
-        if gallery_state["downloaded_images"] >= gallery_state["total_images"]:
-            gallery_state["status"] = "completed"
-            gallery_state["completed_at"] = utc_now()
-        else:
-            gallery_state["status"] = "in_progress"
-            gallery_state["completed_at"] = None
-
-        show_state["status"] = "in_progress"
-        show_state["completed_at"] = None
-        self._refresh_designer_status(designer_state)
-        self.save()
-
-    def mark_show_error(self, show_data, error_message):
-        designer_state, show_state = self.ensure_show(show_data)
+    def mark_show_failed(self, designer, designer_slug, show, show_folder, show_url, kind, error):
+        designer_state, show_state = self.ensure_show(designer, designer_slug, show, show_folder, show_url)
         timestamp = utc_now()
         designer_state["last_attempted_at"] = timestamp
-        designer_state["last_error"] = error_message
-        designer_state["status"] = "in_progress"
-        designer_state["completed_at"] = None
+        designer_state["last_error"] = error
         show_state["last_attempted_at"] = timestamp
-        show_state["last_error"] = error_message
-        show_state["status"] = "in_progress"
-        show_state["completed_at"] = None
+        show_state["last_error"] = error
+        show_state["failure_kind"] = kind
+        if show_state["status"] != "completed":
+            show_state["status"] = "failed"
         self.save()
 
-    def mark_designer_error(self, designer, designer_slug, error_message):
-        designer_state = self.ensure_designer(designer, designer_slug)
-        designer_state["last_attempted_at"] = utc_now()
-        designer_state["last_error"] = error_message
-        designer_state["status"] = "in_progress"
-        designer_state["completed_at"] = None
-        self.save()
-
-    def finalize_show(self, show_data, show_path):
-        return self.sync_show(show_data, show_path)
-
-    def is_designer_completed(self, designer_slug):
-        designer_state = self.data["designers"].get(designer_slug)
-        return bool(designer_state and designer_state.get("status") == "completed")
-
-    def _refresh_designer_status(self, designer_state):
-        shows = list(designer_state["shows"].values())
-        if not shows:
-            designer_state["status"] = "pending"
-            designer_state["completed_at"] = None
-            return
-
-        if all(show["status"] == "completed" for show in shows):
+    def mark_designer_pass(self, designer_slug, url_slug, show_folders):
+        designer_state = self.data["designers"][designer_slug]
+        designer_state["url_slug"] = url_slug
+        designer_state["shows_listed"] = len(show_folders)
+        designer_state["last_listed_at"] = utc_now()
+        shows = designer_state["shows"]
+        # Completion is only decided here, after the full show list was walked: deciding it
+        # from the shows seen so far marked designers done when a run stopped between shows.
+        if all(shows.get(folder, {}).get("status") == "completed" for folder in show_folders):
             designer_state["status"] = "completed"
             designer_state["completed_at"] = designer_state["completed_at"] or utc_now()
-            return
-
-        if any(show["status"] in {"in_progress", "completed"} for show in shows):
+            designer_state["last_error"] = None
+        else:
             designer_state["status"] = "in_progress"
             designer_state["completed_at"] = None
-            return
+        self.save()
 
-        designer_state["status"] = "pending"
+    def mark_designer_not_found(self, designer, designer_slug, error):
+        designer_state = self.ensure_designer(designer, designer_slug)
+        designer_state["status"] = "not_found"
+        designer_state["last_attempted_at"] = utc_now()
+        designer_state["last_error"] = error
         designer_state["completed_at"] = None
+        self.save()
+
+    def mark_designer_error(self, designer, designer_slug, error):
+        designer_state = self.ensure_designer(designer, designer_slug)
+        designer_state["last_attempted_at"] = utc_now()
+        designer_state["last_error"] = error
+        if designer_state["status"] != "completed":
+            designer_state["status"] = "in_progress"
+        designer_state["completed_at"] = None
+        self.save()
+
+    def _ensure_show_data(self, show_data):
+        return self.ensure_show(
+            show_data["designer"],
+            show_data["designer_slug"],
+            show_data["show"],
+            show_data["show_folder"],
+            show_data["show_url"],
+        )
+
+
+class FailureLog:
+    def __init__(self, path):
+        self.path = path
+
+    def add(self, kind, designer, error, show=None, url=None):
+        entry = {
+            "at": utc_now(),
+            "kind": kind,
+            "designer": designer,
+            "show": show,
+            "url": url,
+            "error": error,
+        }
+        with open(self.path, "a", encoding="utf-8") as file:
+            file.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def extract_json_from_script(scripts, key_fragment):
@@ -338,19 +328,12 @@ def extract_json_from_script(scripts, key_fragment):
         return None
 
     try:
-        js_clean = js.split(" = ", 1)[1]
-        brace_count = 0
-        for i, char in enumerate(js_clean):
-            if char == "{":
-                brace_count += 1
-            elif char == "}":
-                brace_count -= 1
-                if brace_count == 0:
-                    js_clean = js_clean[: i + 1]
-                    break
-        return json.loads(js_clean)
-    except Exception as e:
-        print(f"JSON extraction failed: {e}")
+        start = js.index("{", js.index(" = "))
+        # raw_decode stops at the end of the object, so braces inside review text can't break it.
+        data, _ = json.JSONDecoder().raw_decode(js, start)
+        return data
+    except ValueError as e:
+        print(f"    JSON extraction failed: {e}")
         return None
 
 
@@ -363,6 +346,36 @@ def normalize_slug(value):
         .replace("--", "-")
         .lower()
     ).strip("-")
+
+
+def designer_folder_slug(designer):
+    # Kept equal to the original slug so existing folders and state keys stay valid.
+    return normalize_slug(designer).replace("/", "-")
+
+
+def name_key(name):
+    return re.sub(r"[^a-z0-9]", "", unidecode(name).lower())
+
+
+def candidate_slugs(designer):
+    base = unidecode(designer).lower().strip()
+    variants = [
+        re.sub(r"['’]", "", base),
+        base,
+        re.sub(r"['’]", "", base).replace("&", " and "),
+    ]
+    candidates = []
+    for variant in variants:
+        slug = re.sub(r"[^a-z0-9]+", "-", variant).strip("-")
+        if slug and slug not in candidates:
+            candidates.append(slug)
+    # Vogue keeps the dash left by a trailing period ("Agnès B." -> agnes-b-).
+    if base.endswith(".") and candidates and f"{candidates[0]}-" not in candidates:
+        candidates.append(f"{candidates[0]}-")
+    legacy = normalize_slug(designer)
+    if legacy not in candidates and re.fullmatch(r"[a-z0-9-]+", legacy):
+        candidates.append(legacy)
+    return candidates
 
 
 def normalize_show_folder(show):
@@ -508,8 +521,7 @@ class VogueClient:
         if elapsed is None or elapsed >= delay:
             return
 
-        remaining = delay - elapsed
-        time.sleep(remaining)
+        time.sleep(delay - elapsed)
 
     def get(self, url, profile="page", referer=None, timeout=60):
         self._sleep(profile)
@@ -517,28 +529,35 @@ class VogueClient:
             "User-Agent": random.choice(USER_AGENTS),
             "Referer": referer or BASE_URL,
         }
-        response = self.session.get(url, headers=headers, timeout=timeout)
-        self.last_request_at = time.monotonic()
+        try:
+            response = self.session.get(url, headers=headers, timeout=timeout)
+        finally:
+            self.last_request_at = time.monotonic()
         response.raise_for_status()
         return response
 
     def rest(self, profile):
         minimum, maximum = REQUEST_PROFILES[profile]
-        delay = random.uniform(minimum, maximum)
-        time.sleep(delay)
+        time.sleep(random.uniform(minimum, maximum))
 
 
 CLIENT = VogueClient()
 
 
 def fetch_soup(url, profile="page", referer=None):
-    response = CLIENT.get(url, profile=profile, referer=referer)
+    try:
+        response = CLIENT.get(url, profile=profile, referer=referer)
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            raise NotFound(url) from e
+        raise
     return BeautifulSoup(response.content, "html5lib")
 
 
 def read_designers(txt_path):
     with open(txt_path, "r", encoding="utf-8") as file:
-        return [line.strip() for line in file if line.strip()]
+        names = [line.strip() for line in file if line.strip()]
+    return list(dict.fromkeys(names))
 
 
 def get_state_path(save_path, state_path=None):
@@ -546,74 +565,86 @@ def get_state_path(save_path, state_path=None):
 
 
 def resolve_save_path(save_path=None):
-    return save_path or DEFAULT_SAVE_PATH
+    save_path = save_path or DEFAULT_SAVE_PATH
+    parts = Path(save_path).parts
+    # Without this check, an unmounted drive surfaces as a PermissionError deep inside makedirs.
+    if len(parts) > 2 and parts[1] == "Volumes" and not os.path.isdir(os.path.join(*parts[:3])):
+        raise SystemExit(f"Drive not mounted: {os.path.join(*parts[:3])}")
+    return save_path
 
 
-def main(argv=None):
-    argv = argv or sys.argv[1:]
-
-    if not argv:
-        print("Usage:")
-        print("  python3 vogue.py download-all [designers.txt] [save_path]")
-        print("  python3 vogue.py download-designer <designer> [save_path]")
-        print("  python3 vogue.py download-show <designer> <show> [save_path]")
-        return 1
-
-    command = argv[0]
-
-    if command == "download-all":
-        txt_path = argv[1] if len(argv) >= 2 else "designers.txt"
-        save_path = argv[2] if len(argv) >= 3 else None
-        all_designers_to_download_images(txt_path, save_path)
-        return 0
-
-    if command == "download-designer":
-        if len(argv) < 2:
-            print("Usage: python3 vogue.py download-designer <designer> [save_path]")
-            return 1
-        designer = argv[1]
-        save_path = argv[2] if len(argv) >= 3 else None
-        designer_to_download_images(designer, save_path)
-        return 0
-
-    if command == "download-show":
-        if len(argv) < 3:
-            print("Usage: python3 vogue.py download-show <designer> <show> [save_path]")
-            return 1
-        designer = argv[1]
-        show = argv[2]
-        save_path = argv[3] if len(argv) >= 4 else None
-        designer_show_to_download_images(designer, show, save_path)
-        return 0
-
-    print(f"Unknown command: {command}")
-    return 1
+def fetch_designer_directory():
+    html = CLIENT.get(DIRECTORY_URL, profile="page").text
+    pairs = re.findall(
+        r'\{"text":"((?:[^"\\]|\\.)*)","url":"\\u002Ffashion-shows\\u002Fdesigner\\u002F([^"\\]+)"',
+        html,
+    )
+    if not pairs:
+        raise ValueError("designer directory page had no designer links")
+    return [{"name": json.loads(f'"{name}"'), "slug": slug} for name, slug in pairs]
 
 
-def get_show_data(designer, show):
-    show_slug = normalize_slug(show)
+def load_designer_directory(cache_path):
+    entries = None
+    if os.path.exists(cache_path):
+        with open(cache_path, "r", encoding="utf-8") as file:
+            entries = json.load(file)
+    fresh = os.path.exists(cache_path) and time.time() - os.path.getmtime(cache_path) < DIRECTORY_MAX_AGE
+
+    if not fresh:
+        try:
+            entries = fetch_designer_directory()
+            with open(cache_path, "w", encoding="utf-8") as file:
+                json.dump(entries, file, ensure_ascii=False)
+            print(f"Designer directory: {len(entries)} designers")
+        except Exception as e:
+            print(f"Could not refresh designer directory ({e}); using {'cache' if entries else 'guessed slugs'}")
+
+    index = collections.defaultdict(list)
+    for entry in entries or []:
+        slugs = index[name_key(entry["name"])]
+        if entry["slug"] not in slugs:
+            slugs.append(entry["slug"])
+    return index
+
+
+def parse_designer_collections(soup):
+    data = extract_json_from_script(
+        soup.find_all("script", type="text/javascript"),
+        "window.__PRELOADED_STATE__",
+    )
+    if not data:
+        raise ValueError("designer page has no preloaded state")
+    items = data["transformed"]["runwayDesignerContent"]["designerCollections"]
+    return [
+        {"show": item["hed"], "url": urljoin(BASE_URL, item["url"])}
+        for item in items
+        if item.get("hed") and item.get("url")
+    ]
+
+
+def get_show_data(designer, show, show_url=None, designer_slug=None, fetch=fetch_soup):
     show_folder = normalize_show_folder(show)
-    designer_slug = normalize_slug(designer)
-    url = f"{BASE_URL}/fashion-shows/{show_slug}/{designer_slug}"
-    soup = fetch_soup(url, profile="page", referer=f"{BASE_URL}/fashion-shows/designer/{designer_slug}")
+    designer_slug = designer_slug or designer_folder_slug(designer)
+    url = show_url or f"{BASE_URL}/fashion-shows/{normalize_slug(show)}/{designer_slug}"
+    show_slug = urlparse(url).path.rstrip("/").split("/")[-2]
+    soup = fetch(url, referer=f"{BASE_URL}/fashion-shows/designer/{designer_slug}")
 
     data = extract_json_from_script(
         soup.find_all("script", type="text/javascript"),
         "runwayShowGalleries",
     )
     if not data:
-        print(f"Could not load show: {designer} - {show}")
+        return None
+
+    try:
+        galleries = data["transformed"]["runwayShowGalleries"]["galleries"]
+    except (KeyError, TypeError):
         return None
 
     show_description = extract_show_description(soup)
     records = []
     gallery_records = {}
-
-    try:
-        galleries = data["transformed"]["runwayShowGalleries"]["galleries"]
-    except Exception as e:
-        print(f"Failed to find gallery items: {e}")
-        return None
 
     for gallery in galleries:
         gallery_title = gallery.get("title") or "Collection"
@@ -625,22 +656,16 @@ def get_show_data(designer, show):
         for image_index, item in enumerate(gallery.get("items", []), start=1):
             try:
                 image_url = item["image"]["sources"]["md"]["url"]
-            except Exception:
-                print(f"Skipping bad {gallery_slug} image item")
+            except (KeyError, TypeError):
                 continue
 
-            image_name = build_image_name(
-                gallery_slug,
-                image_index,
-                image_url,
-            )
             record = {
                 "designer": designer,
                 "show": show,
                 "gallery": gallery_slug,
                 "show_description": show_description,
                 "image_index": image_index,
-                "image_name": image_name,
+                "image_name": build_image_name(gallery_slug, image_index, image_url),
                 "image_url": image_url,
             }
             gallery_images.append(record)
@@ -686,32 +711,9 @@ def write_show_metadata(show_path, show_data):
         file.write("\n")
 
 
-def designer_to_shows(designer):
-    designer_slug = normalize_slug(designer)
-    url = f"{BASE_URL}/fashion-shows/designer/{designer_slug}"
-    soup = fetch_soup(url, profile="page")
-
-    data = extract_json_from_script(
-        soup.find_all("script", type="text/javascript"),
-        "window.__PRELOADED_STATE__",
-    )
-    if not data:
-        print("Could not find JSON script")
-        return []
-
-    try:
-        return [
-            show["hed"]
-            for show in data["transformed"]["runwayDesignerContent"]["designerCollections"]
-        ]
-    except Exception as e:
-        print(f"Failed to parse shows list: {e}")
-        return []
-
-
 def _download_single_image(session, record, gallery_path, referer):
     export_path = os.path.join(gallery_path, record["image_name"])
-    if os.path.exists(export_path):
+    if is_downloaded(export_path):
         return record, "skipped"
 
     time.sleep(random.uniform(*IMAGE_DELAY))
@@ -722,188 +724,405 @@ def _download_single_image(session, record, gallery_path, referer):
         }
         response = session.get(record["image_url"], headers=headers, timeout=120)
         response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "")
+        # A throttling or error page served with 200 would otherwise be saved as a .jpg
+        # and count as done forever.
+        if not content_type.startswith("image/") or not response.content:
+            return record, f"error: not an image ({content_type or 'no content type'}, {len(response.content)} bytes)"
         temp_path = export_path + ".tmp"
         with open(temp_path, "wb") as file:
             file.write(response.content)
         os.replace(temp_path, export_path)
         return record, "downloaded"
     except Exception as e:
-        print(f"Error downloading {record['image_url']}: {e}")
         return record, f"error: {e}"
 
 
-def designer_show_to_download_images(designer, show, save_path=None, state_path=None, progress=None):
-    save_path = resolve_save_path(save_path)
-    show_data = get_show_data(designer, show)
-    if not show_data:
-        return
+class Scraper:
+    def __init__(self, save_path=None, state_path=None):
+        self.save_path = resolve_save_path(save_path)
+        os.makedirs(self.save_path, exist_ok=True)
+        self.state = ScrapeState(get_state_path(self.save_path, state_path))
+        self.failures = FailureLog(os.path.join(self.save_path, "_failures.jsonl"))
+        self._directory = None
+        self._canary_ok_at = 0.0
 
-    show_path = os.path.join(save_path, show_data["designer_slug"], show_data["show_folder"])
-    os.makedirs(show_path, exist_ok=True)
+    def directory(self):
+        if self._directory is None:
+            self._directory = load_designer_directory(
+                os.path.join(self.save_path, "_designer_directory.json")
+            )
+        return self._directory
 
-    show_pos = ""
-    if progress and "show_index" in progress:
-        show_pos = f"  ({progress['show_index']}/{progress['total_shows']})"
-    print(f"\n  ▸ {show}{show_pos}")
+    def check_not_blocked(self):
+        if time.monotonic() - self._canary_ok_at < 120:
+            return
+        try:
+            CLIENT.get(CANARY_URL, profile="page")
+        except Exception as e:
+            raise Blocked(f"canary page failed too: {e}") from e
+        self._canary_ok_at = time.monotonic()
 
-    state = ScrapeState(get_state_path(save_path, state_path))
-    state.mark_show_started(show_data)
-    state.sync_show(show_data, show_path)
-    write_show_metadata(show_path, show_data)
-    state.mark_metadata_saved(show_data)
+    def fetch(self, url, referer=None):
+        try:
+            return fetch_soup(url, referer=referer)
+        except NotFound:
+            self.check_not_blocked()
+            raise
+        except (requests.ConnectionError, requests.exceptions.RetryError, requests.Timeout):
+            self.check_not_blocked()
+            raise
 
-    if not show_data["images"]:
-        print(f"    ░ no images")
-        state.finalize_show(show_data, show_path)
-        return
+    def fetch_collections(self, url_slug):
+        return parse_designer_collections(self.fetch(f"{BASE_URL}/fashion-shows/designer/{url_slug}"))
 
-    downloaded_count = 0
-    last_error = None
-    total_images = len(show_data["images"])
+    def find_designer(self, designer, designer_state):
+        tried = []
 
-    for gallery_name, gallery_images in show_data["galleries"].items():
-        gallery_path = os.path.join(show_path, gallery_name)
-        os.makedirs(gallery_path, exist_ok=True)
+        def attempt(slug):
+            tried.append(slug)
+            try:
+                return self.fetch_collections(slug)
+            except NotFound:
+                return None
 
-        gallery_total = len(gallery_images)
-        gallery_done = 0
-        gallery_errors = 0
+        cached = designer_state.get("url_slug")
+        if cached:
+            found = attempt(cached)
+            if found is not None:
+                return cached, found
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=IMAGE_WORKERS) as executor:
-            futures = {
-                executor.submit(
-                    _download_single_image,
-                    CLIENT.session,
-                    record,
-                    gallery_path,
-                    show_data["show_url"],
-                ): record
-                for record in gallery_images
-            }
+        matches = [slug for slug in self.directory().get(name_key(designer), []) if slug not in tried]
+        if len(matches) > 1:
+            # The directory lists near-duplicates (viktor-rolf / viktorandrolf); the real
+            # runway page is the one with the most shows.
+            results = [(slug, attempt(slug)) for slug in matches]
+            results = [result for result in results if result[1] is not None]
+            if results:
+                return max(results, key=lambda result: len(result[1]))
 
-            for future in concurrent.futures.as_completed(futures):
-                record, status = future.result()
-                gallery_done += 1
-                if status == "downloaded":
-                    downloaded_count += 1
-                elif status.startswith("error:"):
-                    last_error = status
-                    gallery_errors += 1
+        for slug in matches + candidate_slugs(designer):
+            if slug in tried:
+                continue
+            found = attempt(slug)
+            if found is not None:
+                return slug, found
 
-                bar = _progress_bar(gallery_done, gallery_total)
-                line = f"\r    {gallery_name:<12} {bar}  {gallery_done}/{gallery_total}"
-                sys.stdout.write(f"{line:<60}")
-                sys.stdout.flush()
+        raise NotFound(f"no Vogue designer page (tried: {', '.join(tried)})")
 
-        bar = _progress_bar(gallery_done, gallery_total)
-        if gallery_errors > 0:
-            suffix = f"⚠ {gallery_errors} err"
-        elif gallery_done == gallery_total:
-            suffix = "✓"
+    def download_designer(self, designer, progress=None, only_show=None):
+        designer_slug = designer_folder_slug(designer)
+        designer_state = self.state.ensure_designer(designer, designer_slug)
+
+        try:
+            url_slug, shows = self.find_designer(designer, designer_state)
+        except NotFound as e:
+            self.state.mark_designer_not_found(designer, designer_slug, str(e))
+            self.failures.add("designer_not_found", designer, str(e))
+            print(f"  ✗ {e}")
+            return
+
+        if only_show:
+            wanted = name_key(only_show)
+            shows = [entry for entry in shows if name_key(entry["show"]) == wanted]
+            if not shows:
+                print(f"  ✗ {designer} has no show called {only_show!r}")
+                return
+
+        progress = progress or {}
+        progress["total_shows"] = len(shows)
+        show_folders = [normalize_show_folder(entry["show"]) for entry in shows]
+        pending = [
+            (index, entry)
+            for index, (entry, folder) in enumerate(zip(shows, show_folders), start=1)
+            if designer_state["shows"].get(folder, {}).get("status") != "completed"
+        ]
+        done = len(shows) - len(pending)
+        if done:
+            print(f"  {done}/{len(shows)} shows already complete")
+
+        for position, (index, entry) in enumerate(pending):
+            if position:
+                CLIENT.rest("show")
+            progress["show_index"] = index
+            show_folder = normalize_show_folder(entry["show"])
+            try:
+                self.download_show(designer, designer_slug, entry, progress)
+            except Blocked:
+                raise
+            except NotFound as e:
+                self._show_failed(designer, designer_slug, entry, show_folder, "show_not_found", f"404: {e}")
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                self._show_failed(designer, designer_slug, entry, show_folder, "show_failed", str(e))
+
+        if only_show:
+            self.state.save()
         else:
-            suffix = ""
-        print(f"\r    {gallery_name:<12} {bar}  {gallery_done}/{gallery_total}  {suffix}")
+            self.state.mark_designer_pass(designer_slug, url_slug, show_folders)
 
-    if last_error:
-        state.mark_show_error(show_data, last_error)
+    def _show_failed(self, designer, designer_slug, entry, show_folder, kind, error):
+        print(f"\n  ▸ {entry['show']}\n    ✗ {kind}: {error}")
+        self.state.mark_show_failed(
+            designer, designer_slug, entry["show"], show_folder, entry["url"], kind, error
+        )
+        self.failures.add(kind, designer, error, show=entry["show"], url=entry["url"])
 
-    final_state = state.finalize_show(show_data, show_path)
-    completed_images = sum(
-        gallery_state["downloaded_images"]
-        for gallery_state in final_state["galleries"].values()
+    def download_show(self, designer, designer_slug, entry, progress=None):
+        show = entry["show"]
+        show_pos = ""
+        if progress and "show_index" in progress:
+            show_pos = f"  ({progress['show_index']}/{progress['total_shows']})"
+        print(f"\n  ▸ {show}{show_pos}")
+
+        show_data = get_show_data(
+            designer, show, show_url=entry["url"], designer_slug=designer_slug, fetch=self.fetch,
+        )
+        if not show_data:
+            self._show_failed(
+                designer, designer_slug, entry, normalize_show_folder(show),
+                "show_unparseable", "page has no runway gallery data",
+            )
+            return
+
+        show_path = os.path.join(self.save_path, designer_slug, show_data["show_folder"])
+        os.makedirs(show_path, exist_ok=True)
+
+        self.state.mark_show_started(show_data)
+        write_show_metadata(show_path, show_data)
+
+        if not show_data["images"]:
+            print("    ░ no collection/details images")
+            self.state.sync_show(show_data, show_path)
+            self.state.save()
+            return
+
+        errors = []
+        total_images = len(show_data["images"])
+
+        for gallery_name, gallery_images in show_data["galleries"].items():
+            gallery_path = os.path.join(show_path, gallery_name)
+            os.makedirs(gallery_path, exist_ok=True)
+            gallery_total = len(gallery_images)
+            gallery_done = 0
+            gallery_errors = 0
+
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=IMAGE_WORKERS)
+            try:
+                futures = [
+                    executor.submit(
+                        _download_single_image, CLIENT.session, record, gallery_path, show_data["show_url"],
+                    )
+                    for record in gallery_images
+                ]
+                for future in concurrent.futures.as_completed(futures):
+                    record, status = future.result()
+                    gallery_done += 1
+                    if status.startswith("error:"):
+                        gallery_errors += 1
+                        errors.append((record, status))
+                    bar = _progress_bar(gallery_done, gallery_total)
+                    line = f"\r    {gallery_name:<12} {bar}  {gallery_done}/{gallery_total}"
+                    sys.stdout.write(f"{line:<60}")
+                    sys.stdout.flush()
+            except KeyboardInterrupt:
+                # Without cancelling, Ctrl-C waits for every queued image in the gallery.
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            executor.shutdown()
+
+            bar = _progress_bar(gallery_done, gallery_total)
+            suffix = f"⚠ {gallery_errors} failed" if gallery_errors else "✓"
+            print(f"\r    {gallery_name:<12} {bar}  {gallery_done}/{gallery_total}  {suffix}")
+
+        self.state.sync_show(show_data, show_path)
+        if errors:
+            first_error = errors[0][1][len("error: "):]
+            print(f"    ✗ {len(errors)} image(s) failed, e.g. {first_error[:120]}")
+            self.state.mark_show_failed(
+                designer, designer_slug, show, show_data["show_folder"], show_data["show_url"],
+                "images_failed", f"{len(errors)} image(s) failed: {first_error}",
+            )
+            self.failures.add(
+                "images_failed", designer, f"{len(errors)} image(s) failed: {first_error}",
+                show=show, url=show_data["show_url"],
+            )
+        else:
+            self.state.save()
+
+        show_state = self.state.data["designers"][designer_slug]["shows"][show_data["show_folder"]]
+        completed_images = sum(gallery["downloaded_images"] for gallery in show_state["galleries"].values())
+        status_icon = "✓" if completed_images == total_images else "⚠"
+        designer_pos = ""
+        if progress and "designer_index" in progress:
+            designer_pos = f" │ designer {progress['designer_index']}/{progress['total_designers']}"
+        print(f"[state: {designer} ▸ {show} │ {status_icon} {completed_images}/{total_images}{designer_pos}]")
+
+    def download_designers(self, designers, refresh=False, retry_failed=False):
+        def needs_work(designer):
+            designer_state = self.state.get_designer(designer_folder_slug(designer))
+            status = designer_state["status"] if designer_state else "pending"
+            if retry_failed:
+                return status != "completed"
+            if status == "completed":
+                return refresh
+            # Unresolvable designers cost several requests each; only retry them on request.
+            return status != "not_found"
+
+        todo = [designer for designer in designers if needs_work(designer)]
+        skipped = len(designers) - len(todo)
+        print(f"State file: {self.state.path}")
+        print(f"Failure log: {self.failures.path}")
+        if skipped:
+            print(f"Skipping {skipped} designers (completed or not found). {len(todo)} to go.")
+
+        for designer_index, designer in enumerate(todo, start=1):
+            label = f" {designer} "
+            pos = f"[{designer_index}/{len(todo)}]"
+            fill = max(1, 52 - len(label) - len(pos))
+            print(f"\n━━{label}{'━' * fill} {pos}")
+
+            progress = {
+                "designer": designer,
+                "designer_index": designer_index,
+                "total_designers": len(todo),
+            }
+            for attempt in range(MAX_BLOCK_RETRIES + 1):
+                try:
+                    self.download_designer(designer, progress)
+                    break
+                except Blocked as e:
+                    self.failures.add("blocked", designer, str(e))
+                    if attempt == MAX_BLOCK_RETRIES:
+                        raise
+                    print(f"  ⏸ Vogue is throttling us; cooling down {BLOCK_COOLDOWN // 60} min")
+                    time.sleep(BLOCK_COOLDOWN)
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    self.state.mark_designer_error(designer, designer_folder_slug(designer), str(e))
+                    self.failures.add("designer_failed", designer, str(e))
+                    print(f"  ✗ Failed: {e}")
+                    break
+
+            if designer_index < len(todo):
+                CLIENT.rest("designer")
+
+
+def classify_failure(error):
+    error = error or ""
+    if "SSLError" in error or "CERTIFICATE_VERIFY_FAILED" in error:
+        return "ssl_error"
+    if "assets.vogue.com" in error or "image(s) failed" in error:
+        return "images_failed"
+    if "Max retries" in error or "Connection" in error:
+        return "request_failed"
+    if "fashion-shows/designer/" in error and "404" in error:
+        return "designer_not_found"
+    if "Not Found" in error or error.startswith("404"):
+        return "show_not_found"
+    return "unknown"
+
+
+def build_report(state_data, designers=None):
+    lines = []
+    designer_states = state_data["designers"]
+    if designers is not None:
+        wanted = {designer_folder_slug(designer) for designer in designers}
+        designer_states = {slug: value for slug, value in designer_states.items() if slug in wanted}
+
+    statuses = collections.Counter(value["status"] for value in designer_states.values())
+    total = len(designers) if designers is not None else len(designer_states)
+    lines.append(
+        f"Designers: {total} total · {statuses['completed']} completed · "
+        f"{statuses['not_found']} not found · {statuses['in_progress']} incomplete · "
+        f"{total - sum(statuses.values()) + statuses['pending']} not started"
     )
 
-    status_icon = "✓" if completed_images == total_images else "⚠"
-    designer_pos = ""
-    if progress and "designer_index" in progress:
-        designer_pos = f" │ designer {progress['designer_index']}/{progress['total_designers']}"
-    print(f"[state: {designer} ▸ {show} │ {status_icon} {completed_images}/{total_images}{designer_pos}]")
+    groups = collections.defaultdict(list)
+    for value in sorted(designer_states.values(), key=lambda item: item["designer"]):
+        if value["status"] == "completed":
+            continue
+        if value["status"] == "not_found":
+            groups["designer_not_found"].append(f"{value['designer']}  ({value['last_error']})")
+            continue
+        failed_shows = [show for show in value["shows"].values() if show["status"] != "completed"]
+        if not failed_shows:
+            kind = classify_failure(value.get("last_error"))
+            if kind == "unknown":
+                kind = "interrupted"
+            if value["status"] != "pending" or value.get("last_error"):
+                groups[kind].append(f"{value['designer']}  ({value.get('last_error') or 'interrupted'})")
+            continue
+        for show in failed_shows:
+            kind = show.get("failure_kind") or classify_failure(show.get("last_error"))
+            if kind == "unknown" and not show.get("last_error"):
+                kind = "no_images" if not show["galleries"] else "interrupted"
+            groups[kind].append(f"{value['designer']} ▸ {show['show']}  ({show.get('last_error') or show['status']})")
+
+    for kind, entries in sorted(groups.items(), key=lambda item: -len(item[1])):
+        lines.append("")
+        lines.append(f"{kind} ({len(entries)})")
+        lines.extend(f"  {entry[:200]}" for entry in entries)
+    return "\n".join(lines)
+
+
+def designer_to_collections(designer):
+    for slug in candidate_slugs(designer):
+        try:
+            return parse_designer_collections(fetch_soup(f"{BASE_URL}/fashion-shows/designer/{slug}"))
+        except NotFound:
+            continue
+    print(f"No Vogue designer page found for {designer}")
+    return []
+
+
+def designer_to_shows(designer):
+    return [entry["show"] for entry in designer_to_collections(designer)]
+
+
+def designer_show_to_download_images(designer, show, save_path=None, state_path=None, progress=None):
+    Scraper(save_path, state_path).download_designer(designer, progress, only_show=show)
 
 
 def designer_to_download_images(designer, save_path=None, state_path=None, progress=None):
-    save_path = resolve_save_path(save_path)
-    state = ScrapeState(get_state_path(save_path, state_path))
-    designer_slug = normalize_slug(designer)
-    state.mark_designer_started(designer, designer_slug)
-    shows = designer_to_shows(designer)
-
-    if progress is None:
-        progress = {}
-    progress["total_shows"] = len(shows)
-
-    for index, show in enumerate(shows, start=1):
-        progress["show_index"] = index
-        designer_show_to_download_images(
-            designer, show, save_path, state_path=state.path, progress=progress,
-        )
-        if index < len(shows):
-            CLIENT.rest("show")
+    Scraper(save_path, state_path).download_designer(designer, progress)
 
 
-def all_designers_to_download_images(txt_path, save_path=None, state_path=None):
-    save_path = resolve_save_path(save_path)
-    os.makedirs(save_path, exist_ok=True)
-    resolved_state_path = get_state_path(save_path, state_path)
-    state = ScrapeState(resolved_state_path)
-
+def all_designers_to_download_images(txt_path, save_path=None, state_path=None, refresh=False, retry_failed=False):
     try:
         designers = read_designers(txt_path)
-    except Exception as e:
+    except OSError as e:
         print(f"Error reading file {txt_path}: {e}")
         return
-
     if not designers:
         print("No designers found in the file.")
         return
-
-    print(f"State file: {state.path}")
-
-    total = len(designers)
-    for designer_index, designer in enumerate(designers, start=1):
-        designer_slug = normalize_slug(designer)
-        if state.is_designer_completed(designer_slug):
-            print(f"  ✓ {designer:<40} [{designer_index}/{total}]")
-            continue
-
-        label = f" {designer} "
-        pos = f"[{designer_index}/{total}]"
-        fill = max(1, 52 - len(label) - len(pos))
-        print(f"\n━━{label}{'━' * fill} {pos}")
-
-        progress = {
-            "designer": designer,
-            "designer_index": designer_index,
-            "total_designers": total,
-        }
-        try:
-            designer_to_download_images(
-                designer, save_path, state_path=resolved_state_path, progress=progress,
-            )
-        except Exception as e:
-            state = ScrapeState(resolved_state_path)
-            state.mark_designer_error(designer, designer_slug, str(e))
-            print(f"  ✗ Failed: {e}")
-
-        state = ScrapeState(resolved_state_path)
-
-        if designer_index < len(designers):
-            CLIENT.rest("designer")
+    Scraper(save_path, state_path).download_designers(designers, refresh=refresh, retry_failed=retry_failed)
 
 
-def designer_show_to_csv(designer, show, save_path=None):
+def designer_show_to_csv(designer, show, save_path=None, show_url=None):
     csv_path = None
     if save_path:
         os.makedirs(save_path, exist_ok=True)
         csv_path = os.path.join(
             save_path,
-            f"{normalize_slug(designer)}_{normalize_show_folder(show)}.csv",
+            f"{designer_folder_slug(designer)}_{normalize_show_folder(show)}.csv",
         )
         if os.path.exists(csv_path):
             print(f"CSV already exists: {csv_path}")
             return None
 
-    show_data = get_show_data(designer, show)
+    if not show_url:
+        wanted = name_key(show)
+        show_url = next(
+            (entry["url"] for entry in designer_to_collections(designer) if name_key(entry["show"]) == wanted),
+            None,
+        )
+    show_data = get_show_data(designer, show, show_url=show_url)
     if not show_data:
+        print(f"Could not load show: {designer} - {show}")
         return None
 
     rows = show_data["images"]
@@ -918,23 +1137,26 @@ def designer_show_to_csv(designer, show, save_path=None):
 
 
 def designer_to_csv(designer, save_path):
-    designer_slug = normalize_slug(designer)
     os.makedirs(save_path, exist_ok=True)
-    csv_path = os.path.join(save_path, f"{designer_slug}_all_shows.csv")
+    csv_path = os.path.join(save_path, f"{designer_folder_slug(designer)}_all_shows.csv")
 
     if os.path.exists(csv_path):
         print(f"CSV already exists: {csv_path}")
         return
 
-    shows = designer_to_shows(designer)
+    shows = designer_to_collections(designer)
     if not shows:
         print(f"No shows found for {designer}")
         return
 
     all_rows = []
-    for index, show in enumerate(shows, start=1):
-        print(f"Scraping [{index}/{len(shows)}] {designer} - {show}")
-        rows = designer_show_to_csv(designer, show)
+    for index, entry in enumerate(shows, start=1):
+        print(f"Scraping [{index}/{len(shows)}] {designer} - {entry['show']}")
+        try:
+            rows = designer_show_to_csv(designer, entry["show"], show_url=entry["url"])
+        except NotFound:
+            print(f"Show page not found: {entry['url']}")
+            rows = None
         if rows:
             all_rows.extend(rows)
         if index < len(shows):
@@ -955,9 +1177,8 @@ def all_designers_to_csv(txt_path, save_path):
     csv_path = os.path.join(save_path, "all_designers.csv")
 
     try:
-        with open(txt_path, "r", encoding="utf-8") as file:
-            designers = [line.strip() for line in file if line.strip()]
-    except Exception as e:
+        designers = read_designers(txt_path)
+    except OSError as e:
         print(f"Error reading file {txt_path}: {e}")
         return
 
@@ -981,14 +1202,15 @@ def all_designers_to_csv(txt_path, save_path):
         for designer_index, designer in enumerate(designers, start=1):
             print(f"\nStarting designer [{designer_index}/{len(designers)}]: {designer}")
             try:
-                shows = designer_to_shows(designer)
-                for show_index, show in enumerate(shows, start=1):
+                shows = designer_to_collections(designer)
+                for show_index, entry in enumerate(shows, start=1):
+                    show = entry["show"]
                     if (designer, show) in existing_rows:
                         print(f"Already scraped: {designer} - {show}")
                         continue
 
                     print(f"Scraping [{show_index}/{len(shows)}] {designer} - {show}")
-                    rows = designer_show_to_csv(designer, show)
+                    rows = designer_show_to_csv(designer, show, show_url=entry["url"])
                     if rows:
                         writer.writerows(rows)
                         file.flush()
@@ -1001,6 +1223,66 @@ def all_designers_to_csv(txt_path, save_path):
 
             if designer_index < len(designers):
                 CLIENT.rest("designer")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="vogue.py",
+        description="Resumable Vogue Runway image scraper. Rerun any command to resume.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    download_all = commands.add_parser("download-all", help="download every designer in a list")
+    download_all.add_argument("designers_file", nargs="?", default="designers.txt")
+    download_all.add_argument("save_path", nargs="?")
+    download_all.add_argument(
+        "--refresh", action="store_true",
+        help="revisit completed designers to pick up new collections",
+    )
+
+    retry = commands.add_parser("retry-failed", help="retry only designers that failed or are incomplete")
+    retry.add_argument("designers_file", nargs="?", default="designers.txt")
+    retry.add_argument("save_path", nargs="?")
+
+    designer = commands.add_parser("download-designer", help="download all shows of one designer")
+    designer.add_argument("designer")
+    designer.add_argument("save_path", nargs="?")
+
+    show = commands.add_parser("download-show", help="download one show")
+    show.add_argument("designer")
+    show.add_argument("show", help='show title as on Vogue, e.g. "Spring 2018 Ready-to-Wear"')
+    show.add_argument("save_path", nargs="?")
+
+    report = commands.add_parser("report", help="summarize what failed or is still incomplete")
+    report.add_argument("designers_file", nargs="?", default="designers.txt")
+    report.add_argument("save_path", nargs="?")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    try:
+        if args.command == "download-all":
+            all_designers_to_download_images(args.designers_file, args.save_path, refresh=args.refresh)
+        elif args.command == "retry-failed":
+            all_designers_to_download_images(args.designers_file, args.save_path, retry_failed=True)
+        elif args.command == "download-designer":
+            designer_to_download_images(args.designer, args.save_path)
+        elif args.command == "download-show":
+            designer_show_to_download_images(args.designer, args.show, args.save_path)
+        elif args.command == "report":
+            save_path = resolve_save_path(args.save_path)
+            state = ScrapeState(get_state_path(save_path))
+            designers = read_designers(args.designers_file) if os.path.exists(args.designers_file) else None
+            print(build_report(state.data, designers))
+    except KeyboardInterrupt:
+        print("\n\nStopped. Run the same command again to resume.")
+        return 130
+    except Blocked as e:
+        print(f"\n\nVogue kept blocking requests ({e}). Stopped; rerun later to resume.")
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

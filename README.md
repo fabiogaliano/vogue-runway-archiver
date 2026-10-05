@@ -101,14 +101,36 @@ Long runs keep a central state file at:
 vogue_downloads/_scrape_state.json
 ```
 
-You can stop the terminal and run the same command again later. The scraper will:
+You can stop the terminal (Ctrl-C) and run the same command again later. The scraper will:
 
 - reload the saved state
 - check files already on disk
 - continue from the remaining designers, shows, and images
 
+A designer only counts as complete once every show on its Vogue page is downloaded.
+
+```bash
+python3 vogue.py download-all --refresh   # revisit completed designers for new collections
+python3 vogue.py retry-failed             # retry only designers that failed or are incomplete
+python3 vogue.py report                   # what failed, grouped by cause
+```
+
+`download-all` skips designers Vogue has no page for; `retry-failed` tries them again.
+
+## Failures
+
+- `_failures.jsonl` (next to the state file) gets one line per failure: time, kind, designer, show, URL, error
+- `report` groups everything still incomplete by kind: `designer_not_found`, `show_not_found`, `show_unparseable`, `images_failed`, `request_failed`, `ssl_error`, ...
+- When Vogue throttles (it answers 404/429), the scraper checks a known page, pauses 15 minutes, and stops after repeated blocks instead of marking everything as failed
+
+## Designer URLs
+
+Vogue's URL names don't always follow the names in `designers.txt` (`Agnès B.` → `agnes-b-`, `Burberry` → `burberry-prorsum`). The scraper looks names up in Vogue's designer directory (cached for a week in `_designer_directory.json`) and falls back to guessed slugs. The slug that worked is stored in the state file. Show URLs are taken from the designer page instead of being guessed.
+
 ## Notes
 
 - Requests are intentionally slowed with randomized delays, rotating user agents, and retries
 - show folders use designer-first, year-first naming like `miu-miu/2026-fall-ready-to-wear/`
+- images are 1024px wide and Vogue serves them as WebP, so the `.jpg` files are WebP data
+- some shows (e.g. Celine 2020–2022) have no runway images on Vogue; they're marked complete with `"empty": true`
 - CSV rows include `designer`, `show`, `gallery`, `show_description`, `image_index`, `image_name`, and `image_url`
