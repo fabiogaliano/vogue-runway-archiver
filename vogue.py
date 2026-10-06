@@ -22,7 +22,7 @@ from unidecode import unidecode
 
 
 BASE_URL = "https://www.vogue.com"
-DEFAULT_SAVE_PATH = "vogue_downloads"
+DEFAULT_SAVE_PATH = os.environ.get("VOGUE_SAVE_PATH", "vogue_downloads")
 DIRECTORY_URL = f"{BASE_URL}/fashion-shows/designers"
 DIRECTORY_MAX_AGE = 7 * 24 * 3600
 # Vogue answers with 404/429 when it throttles us, which looks identical to a wrong
